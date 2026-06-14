@@ -1,0 +1,6 @@
+.env
+service-account.json
+node_modules/
+storage/
+coverage/
+npm-debug.log*
