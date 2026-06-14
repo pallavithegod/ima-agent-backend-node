@@ -13,6 +13,7 @@ database.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
+    firebase_uid TEXT,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'engineer',
     created_at TEXT NOT NULL
@@ -43,6 +44,19 @@ database.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(user_id, vercel_project_id),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS render_services (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    render_service_id TEXT NOT NULL,
+    render_service_name TEXT NOT NULL,
+    render_owner_id TEXT,
+    github_repository TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(user_id, render_service_id),
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
   );
   CREATE TABLE IF NOT EXISTS monitored_repositories (
@@ -94,6 +108,7 @@ database.exec(`
 `);
 
 for (const [table, column, definition] of [
+  ["users", "firebase_uid", "TEXT"],
   ["provider_connections", "refresh_token", "TEXT"],
   ["provider_connections", "token_expires_at", "TEXT"],
   ["oauth_states", "nonce", "TEXT"],

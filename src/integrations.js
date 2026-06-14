@@ -3,8 +3,13 @@ import express from "express";
 import { z } from "zod";
 import { authenticate } from "./auth.js";
 import { config } from "./config.js";
-import { decryptSecret, encryptSecret } from "./crypto.js";
+import { decryptSecret } from "./crypto.js";
 import { database } from "./database.js";
+import {
+  connection,
+  deleteConnection,
+  upsertConnection,
+} from "./providerCredentials.js";
 
 export const integrationsRouter = express.Router();
 integrationsRouter.use((request, response, next) => {
@@ -19,6 +24,10 @@ const githubHeaders = (token) => ({
   "X-GitHub-Api-Version": "2022-11-28",
 });
 const vercelHeaders = (token) => ({ Authorization: `Bearer ${token}` });
+const renderHeaders = (token) => ({
+  Accept: "application/json",
+  Authorization: `Bearer ${token}`,
+});
 
 async function checkedFetch(url, options) {
   const response = await fetch(url, options);
@@ -33,43 +42,24 @@ async function optionalFetch(url, options) {
   return { ok: response.ok, status: response.status, payload };
 }
 
-function upsertConnection(
-  userId,
-  provider,
-  token,
-  accountId,
-  accountName,
-  metadata = {},
-  refreshToken = null,
-  tokenExpiresAt = null,
-) {
-  const now = new Date().toISOString();
-  database.prepare(`
-    INSERT INTO provider_connections
-      (user_id, provider, access_token, refresh_token, token_expires_at,
-       account_id, account_name, metadata, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(user_id, provider) DO UPDATE SET
-      access_token=excluded.access_token,
-      refresh_token=COALESCE(excluded.refresh_token, provider_connections.refresh_token),
-      token_expires_at=excluded.token_expires_at, account_id=excluded.account_id,
-      account_name=excluded.account_name, metadata=excluded.metadata, updated_at=excluded.updated_at
-  `).run(
-    userId,
-    provider,
-    encryptSecret(token),
-    refreshToken ? encryptSecret(refreshToken) : null,
-    tokenExpiresAt,
-    accountId,
-    accountName,
-    JSON.stringify(metadata),
-    now,
-    now,
+async function inspectProvider(authorization, provider) {
+  const response = await fetch(
+    `${config.pythonBackendUrl.replace(/\/$/, "")}/api/integrations/${provider}/sync`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: authorization,
+        "Content-Type": "application/json",
+      },
+    },
   );
-}
-
-function connection(userId, provider) {
-  return database.prepare("SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?").get(userId, provider);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      payload.detail || payload.error || `${provider} inspection failed (${response.status})`,
+    );
+  }
+  return payload;
 }
 
 function repositoryShape(repo, imported = false, vercelProject = null) {
@@ -120,6 +110,76 @@ function projectFromDeployment(deployment) {
     updatedAt: deployment.createdAt ? new Date(deployment.createdAt).toISOString() : null,
     githubRepository: owner && repo ? `${owner}/${repo}` : repo,
   };
+}
+
+function githubRepositoryFromUrl(value) {
+  if (!value) return null;
+  const match = String(value).match(/github\.com[/:]([^/]+)\/([^/#]+?)(?:\.git)?$/i);
+  return match ? `${match[1]}/${match[2]}` : null;
+}
+
+function renderServiceShape(item) {
+  const service = item.service || item;
+  return {
+    id: service.id,
+    name: service.name,
+    ownerId: service.ownerId || service.owner?.id || null,
+    githubRepository:
+      githubRepositoryFromUrl(service.repo)
+      || githubRepositoryFromUrl(service.repository)
+      || githubRepositoryFromUrl(service.serviceDetails?.repo),
+    type: service.type || service.serviceDetails?.runtime || "service",
+    url: service.serviceDetails?.url || service.url || null,
+  };
+}
+
+async function renderServicesForUser(userId) {
+  const item = connection(userId, "render");
+  if (!item) throw new Error("Connect Render first");
+  const payload = await checkedFetch("https://api.render.com/v1/services?limit=100", {
+    headers: renderHeaders(decryptSecret(item.access_token)),
+  });
+  return (Array.isArray(payload) ? payload : payload.services || [])
+    .map(renderServiceShape)
+    .filter((service) => service.id);
+}
+
+function matchRenderRepositories(userId, services) {
+  const repositories = database.prepare(
+    "SELECT github_repository FROM monitored_repositories WHERE user_id = ?",
+  ).all(userId);
+  const now = new Date().toISOString();
+  const matches = [];
+  for (const repository of repositories) {
+    const fullName = repository.github_repository.toLowerCase();
+    const repoName = fullName.split("/").at(-1);
+    let service = services.find(
+      (item) => item.githubRepository?.toLowerCase() === fullName,
+    );
+    if (!service) {
+      const sameName = services.filter(
+        (item) => item.githubRepository?.split("/").at(-1)?.toLowerCase() === repoName,
+      );
+      service = sameName.length === 1 ? sameName[0] : null;
+    }
+    if (!service) continue;
+    database.prepare(`
+      INSERT INTO render_services
+        (user_id, render_service_id, render_service_name, render_owner_id,
+         github_repository, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, render_service_id) DO UPDATE SET
+        render_service_name=excluded.render_service_name,
+        render_owner_id=excluded.render_owner_id,
+        github_repository=excluded.github_repository,
+        enabled=1, updated_at=excluded.updated_at
+    `).run(
+      userId, service.id, service.name, service.ownerId,
+      repository.github_repository, now, now,
+    );
+    matches.push({ repository: repository.github_repository, service });
+  }
+  return matches;
 }
 
 async function vercelProjectsForUser(userId) {
@@ -205,6 +265,130 @@ function matchImportedRepositories(userId, projects) {
   return matches;
 }
 
+function monitoredRepository(userId, repository) {
+  if (!repository) return null;
+  return database.prepare(`
+    SELECT github_repository
+    FROM monitored_repositories
+    WHERE user_id = ? AND lower(github_repository) = lower(?)
+  `).get(userId, repository);
+}
+
+async function vercelHealthForUser(userId) {
+  if (!connection(userId, "vercel")) return [];
+  const token = await vercelAccessToken(userId);
+  const discovery = await vercelProjectsForUser(userId);
+  const tracked = database.prepare(
+    "SELECT * FROM tracked_projects WHERE user_id = ? AND enabled = 1",
+  ).all(userId);
+  const resources = new Map();
+  for (const project of discovery.projects) {
+    const key = `${project.githubRepository || "unlinked"}:${project.name}`.toLowerCase();
+    const current = resources.get(key);
+    resources.set(key, {
+      ...current,
+      ...project,
+      teamId: project.teamId || current?.teamId || null,
+      githubRepository: project.githubRepository || current?.githubRepository || null,
+    });
+  }
+  for (const project of tracked) {
+    const key = `${project.github_repository || "unlinked"}:${project.vercel_project_name}`.toLowerCase();
+    if (!resources.has(key)) {
+      resources.set(key, {
+        id: project.vercel_project_id,
+        name: project.vercel_project_name,
+        teamId: project.vercel_team_id,
+        githubRepository: project.github_repository,
+      });
+    }
+  }
+  return Promise.all([...resources.values()].map(async (project) => {
+    const params = new URLSearchParams({ projectId: project.id, limit: "1" });
+    if (project.teamId) params.set("teamId", project.teamId);
+    const result = await optionalFetch(`https://api.vercel.com/v6/deployments?${params}`, {
+      headers: vercelHeaders(token),
+    });
+    const deployment = result.ok ? result.payload.deployments?.[0] : null;
+    const repository = project.githubRepository
+      || tracked.find((item) => item.vercel_project_id === project.id)?.github_repository
+      || null;
+    const mapping = tracked.find((item) => item.vercel_project_id === project.id);
+    return {
+      provider: "vercel",
+      resourceId: project.id,
+      resourceName: project.name,
+      ownerId: project.teamId,
+      repository,
+      repositoryImported: Boolean(monitoredRepository(userId, repository)),
+      tracked: Boolean(mapping),
+      accessible: result.ok,
+      latestDeployment: deployment ? {
+        id: deployment.uid || deployment.id,
+        status: deployment.readyState || deployment.state || deployment.status || "UNKNOWN",
+        commitSha: deployment.meta?.githubCommitSha || deployment.meta?.gitCommitSha || null,
+        message: deployment.meta?.githubCommitMessage || deployment.meta?.gitCommitMessage || null,
+        createdAt: deployment.createdAt ? new Date(deployment.createdAt).toISOString() : null,
+        url: deployment.url ? `https://${deployment.url}` : null,
+      } : null,
+    };
+  }));
+}
+
+async function renderHealthForUser(userId) {
+  if (!connection(userId, "render")) return [];
+  const token = decryptSecret(connection(userId, "render").access_token);
+  const services = await renderServicesForUser(userId);
+  const tracked = database.prepare(
+    "SELECT * FROM render_services WHERE user_id = ? AND enabled = 1",
+  ).all(userId);
+  const resources = new Map(services.map((service) => [service.id, service]));
+  for (const service of tracked) {
+    if (!resources.has(service.render_service_id)) {
+      resources.set(service.render_service_id, {
+        id: service.render_service_id,
+        name: service.render_service_name,
+        ownerId: service.render_owner_id,
+        githubRepository: service.github_repository,
+        url: null,
+      });
+    }
+  }
+  return Promise.all([...resources.values()].map(async (service) => {
+    const result = await optionalFetch(
+      `https://api.render.com/v1/services/${encodeURIComponent(service.id)}/deploys?limit=1`,
+      { headers: renderHeaders(token) },
+    );
+    const row = result.ok
+      ? (Array.isArray(result.payload) ? result.payload[0] : result.payload.deploys?.[0])
+      : null;
+    const deployment = row?.deploy || row || null;
+    const mapping = tracked.find((item) => item.render_service_id === service.id);
+    const repository = service.githubRepository || mapping?.github_repository || null;
+    const commit = deployment?.commit;
+    return {
+      provider: "render",
+      resourceId: service.id,
+      resourceName: service.name,
+      ownerId: service.ownerId,
+      repository,
+      repositoryImported: Boolean(monitoredRepository(userId, repository)),
+      tracked: Boolean(mapping),
+      accessible: result.ok,
+      latestDeployment: deployment ? {
+        id: deployment.id,
+        status: deployment.status || "UNKNOWN",
+        commitSha: typeof commit === "object"
+          ? commit?.id || commit?.sha || null
+          : commit || deployment.commitId || null,
+        message: typeof commit === "object" ? commit?.message || null : null,
+        createdAt: deployment.createdAt || null,
+        url: service.url,
+      } : null,
+    };
+  }));
+}
+
 function tokenExpiry(expiresIn) {
   return new Date(Date.now() + Number(expiresIn || 3600) * 1000).toISOString();
 }
@@ -234,7 +418,7 @@ async function vercelAccessToken(userId) {
     grant_type: "refresh_token",
     refresh_token: decryptSecret(item.refresh_token),
   });
-  upsertConnection(
+  await upsertConnection(
     userId,
     "vercel",
     tokens.access_token,
@@ -254,6 +438,9 @@ integrationsRouter.get("/status", (request, response) => {
   const projects = database.prepare(
     "SELECT * FROM tracked_projects WHERE user_id = ? ORDER BY created_at DESC",
   ).all(request.auth.sub);
+  const renderServices = database.prepare(
+    "SELECT * FROM render_services WHERE user_id = ? ORDER BY created_at DESC",
+  ).all(request.auth.sub);
   const repositories = database.prepare(
     "SELECT * FROM monitored_repositories WHERE user_id = ? ORDER BY created_at DESC",
   ).all(request.auth.sub);
@@ -264,8 +451,11 @@ integrationsRouter.get("/status", (request, response) => {
   response.json({
     connections: connections.map((item) => ({ ...item, metadata: JSON.parse(item.metadata) })),
     projects,
+    renderServices,
     repositories,
-    monitorActive: projects.some((project) => project.enabled === 1),
+    monitorActive:
+      projects.some((project) => project.enabled === 1)
+      || renderServices.some((service) => service.enabled === 1),
     vercelProjectAccessEnabled:
       vercelMetadata.auth_mode === "access_token" || projects.length > 0,
     vercelAuthorizationConfigured: Boolean(config.vercelClientId && config.vercelClientSecret),
@@ -350,7 +540,7 @@ integrationsRouter.post("/vercel/token", async (request, response, next) => {
       return response.status(401).json({ error: "Vercel access token is invalid" });
     }
     const user = result.payload.user || result.payload;
-    upsertConnection(
+    await upsertConnection(
       request.auth.sub,
       "vercel",
       input.accessToken,
@@ -405,7 +595,7 @@ integrationsRouter.get("/vercel/callback", async (request, response, next) => {
     const profile = await checkedFetch("https://api.vercel.com/login/oauth/userinfo", {
       headers: vercelHeaders(tokens.access_token),
     });
-    upsertConnection(
+    await upsertConnection(
       state.user_id,
       "vercel",
       tokens.access_token,
@@ -421,7 +611,7 @@ integrationsRouter.get("/vercel/callback", async (request, response, next) => {
     } catch (error) {
       console.warn("Vercel connected, but existing repositories could not be matched:", error.message);
     }
-    response.redirect(`${config.frontendUrl}/?integration=vercel&status=connected`);
+    response.redirect(`${config.frontendUrl}/`);
   } catch (error) {
     next(error);
   }
@@ -514,10 +704,37 @@ integrationsRouter.post("/repositories/import", async (request, response, next) 
         );
       }
     }
+    let matchedRender = false;
+    if (connection(request.auth.sub, "render")) {
+      try {
+        const renderMatches = matchRenderRepositories(
+          request.auth.sub,
+          await renderServicesForUser(request.auth.sub),
+        );
+        matchedRender = renderMatches.some(
+          (match) => match.repository.toLowerCase() === repo.full_name.toLowerCase(),
+        );
+      } catch (error) {
+        console.warn("Render repository matching failed:", error.message);
+      }
+    }
+    const providers = [
+      ...(matchedProject ? ["vercel"] : []),
+      ...(matchedRender ? ["render"] : []),
+    ];
+    const inspections = await Promise.allSettled(
+      providers.map((provider) => inspectProvider(request.headers.authorization, provider)),
+    );
     response.status(201).json({
       repository: repositoryShape(repo, true, matchedProject),
       matchedProject,
       requiresProjectMapping: Boolean(connection(request.auth.sub, "vercel") && !matchedProject),
+      inspections: inspections.map((result, index) => ({
+        provider: providers[index],
+        started: result.status === "fulfilled",
+        result: result.status === "fulfilled" ? result.value : null,
+        error: result.status === "rejected" ? result.reason?.message || "Inspection failed" : null,
+      })),
     });
   } catch (error) {
     next(error);
@@ -550,7 +767,7 @@ integrationsRouter.post("/render/connect", async (request, response, next) => {
     });
     if (!result.ok) return response.status(401).json({ error: "Render API key is invalid or lacks account access" });
     const owner = Array.isArray(result.payload) ? result.payload[0]?.owner || result.payload[0] : null;
-    upsertConnection(
+    await upsertConnection(
       request.auth.sub,
       "render",
       input.apiKey,
@@ -558,20 +775,152 @@ integrationsRouter.post("/render/connect", async (request, response, next) => {
       owner?.name || owner?.email || "Render account",
       {},
     );
-    response.status(201).json({ connected: true, accountName: owner?.name || "Render account" });
+    const services = await renderServicesForUser(request.auth.sub);
+    const matches = matchRenderRepositories(request.auth.sub, services);
+    response.status(201).json({
+      connected: true,
+      accountName: owner?.name || "Render account",
+      services: services.length,
+      matches: matches.length,
+    });
   } catch (error) {
     next(error);
   }
 });
 
-integrationsRouter.delete("/connections/:provider", (request, response) => {
-  if (!["vercel", "render"].includes(request.params.provider)) {
-    return response.status(400).json({ error: "This provider cannot be disconnected here" });
+integrationsRouter.get("/render/services", async (request, response, next) => {
+  try {
+    response.json({ services: await renderServicesForUser(request.auth.sub) });
+  } catch (error) {
+    next(error);
   }
-  database.prepare(
-    "DELETE FROM provider_connections WHERE user_id = ? AND provider = ?",
-  ).run(request.auth.sub, request.params.provider);
-  response.status(204).end();
+});
+
+integrationsRouter.post("/render/rematch", async (request, response, next) => {
+  try {
+    const services = await renderServicesForUser(request.auth.sub);
+    response.json({
+      services,
+      matches: matchRenderRepositories(request.auth.sub, services),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+integrationsRouter.get("/provider-health", async (request, response, next) => {
+  try {
+    const [vercel, render] = await Promise.all([
+      vercelHealthForUser(request.auth.sub).catch((error) => [{
+        provider: "vercel",
+        accessible: false,
+        error: error.message,
+      }]),
+      renderHealthForUser(request.auth.sub).catch((error) => [{
+        provider: "render",
+        accessible: false,
+        error: error.message,
+      }]),
+    ]);
+    response.json({ resources: [...vercel, ...render] });
+  } catch (error) {
+    next(error);
+  }
+});
+
+integrationsRouter.post("/provider-health/track", async (request, response, next) => {
+  try {
+    const input = z.object({
+      provider: z.enum(["vercel", "render"]),
+      resourceId: z.string().min(1),
+      resourceName: z.string().min(1),
+      ownerId: z.string().nullable().optional(),
+      repository: z.string().regex(/^[^/]+\/[^/]+$/),
+    }).parse(request.body);
+    if (!monitoredRepository(request.auth.sub, input.repository)) {
+      return response.status(409).json({
+        error: "Import the linked GitHub repository before monitoring this deployment",
+      });
+    }
+    const now = new Date().toISOString();
+    if (input.provider === "vercel") {
+      database.prepare(`
+        INSERT INTO tracked_projects
+          (user_id, vercel_project_id, vercel_project_name, vercel_team_id,
+           github_repository, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, vercel_project_id) DO UPDATE SET
+          vercel_project_name=excluded.vercel_project_name,
+          vercel_team_id=excluded.vercel_team_id,
+          github_repository=excluded.github_repository, enabled=1,
+          updated_at=excluded.updated_at
+      `).run(
+        request.auth.sub,
+        input.resourceId,
+        input.resourceName,
+        input.ownerId || null,
+        input.repository,
+        now,
+        now,
+      );
+    } else {
+      database.prepare(`
+        INSERT INTO render_services
+          (user_id, render_service_id, render_service_name, render_owner_id,
+           github_repository, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, render_service_id) DO UPDATE SET
+          render_service_name=excluded.render_service_name,
+          render_owner_id=excluded.render_owner_id,
+          github_repository=excluded.github_repository, enabled=1,
+          updated_at=excluded.updated_at
+      `).run(
+        request.auth.sub,
+        input.resourceId,
+        input.resourceName,
+        input.ownerId || null,
+        input.repository,
+        now,
+        now,
+      );
+    }
+    let inspection = null;
+    let inspectionError = null;
+    try {
+      inspection = await inspectProvider(request.headers.authorization, input.provider);
+    } catch (error) {
+      inspectionError = error.message;
+    }
+    response.status(201).json({ tracked: true, inspection, inspectionError });
+  } catch (error) {
+    next(error);
+  }
+});
+
+integrationsRouter.post("/provider-health/:provider/inspect", async (request, response, next) => {
+  try {
+    if (!["vercel", "render"].includes(request.params.provider)) {
+      return response.status(400).json({ error: "Unsupported deployment provider" });
+    }
+    response.json(await inspectProvider(
+      request.headers.authorization,
+      request.params.provider,
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
+integrationsRouter.delete("/connections/:provider", async (request, response, next) => {
+  try {
+    if (!["vercel", "render"].includes(request.params.provider)) {
+      return response.status(400).json({ error: "This provider cannot be disconnected here" });
+    }
+    await deleteConnection(request.auth.sub, request.params.provider);
+    response.status(204).end();
+  } catch (error) {
+    next(error);
+  }
 });
 
 integrationsRouter.get("/repositories/:owner/:repo/activity", async (request, response, next) => {
@@ -657,7 +1006,8 @@ integrationsRouter.get("/repositories/:owner/:repo/activity", async (request, re
   }
 });
 
-integrationsRouter.post("/tracked-projects", (request, response) => {
+integrationsRouter.post("/tracked-projects", async (request, response, next) => {
+  try {
   const input = z.object({
     vercelProjectId: z.string().min(1),
     vercelProjectName: z.string().min(1),
@@ -674,7 +1024,17 @@ integrationsRouter.post("/tracked-projects", (request, response) => {
       vercel_project_name=excluded.vercel_project_name, vercel_team_id=excluded.vercel_team_id,
       github_repository=excluded.github_repository, enabled=1, updated_at=excluded.updated_at
   `).run(request.auth.sub, input.data.vercelProjectId, input.data.vercelProjectName, input.data.vercelTeamId || null, input.data.githubRepository, now, now);
-  response.status(201).json({ tracked: true });
+  let inspection = null;
+  let inspectionError = null;
+  try {
+    inspection = await inspectProvider(request.headers.authorization, "vercel");
+  } catch (error) {
+    inspectionError = error.message;
+  }
+  response.status(201).json({ tracked: true, inspection, inspectionError });
+  } catch (error) {
+    next(error);
+  }
 });
 
 integrationsRouter.delete("/tracked-projects/:id", (request, response) => {
@@ -686,11 +1046,17 @@ integrationsRouter.get("/runtime", async (request, response, next) => {
   try {
   const github = connection(request.auth.sub, "github");
   const vercel = connection(request.auth.sub, "vercel");
+  const render = connection(request.auth.sub, "render");
   const projects = database.prepare("SELECT * FROM tracked_projects WHERE user_id = ? AND enabled = 1").all(request.auth.sub);
+  const renderServices = database.prepare(
+    "SELECT * FROM render_services WHERE user_id = ? AND enabled = 1",
+  ).all(request.auth.sub);
   response.json({
     githubToken: github ? decryptSecret(github.access_token) : null,
     vercelToken: vercel ? await vercelAccessToken(request.auth.sub) : null,
+    renderToken: render ? decryptSecret(render.access_token) : null,
     projects,
+    renderServices,
   });
   } catch (error) {
     next(error);

@@ -10,7 +10,7 @@ import { hashPassword, verifyPassword } from "./password.js";
 import { integrationsRouter } from "./integrations.js";
 import { authenticate } from "./auth.js";
 import { verifyFirebaseToken } from "./firebase.js";
-import { encryptSecret } from "./crypto.js";
+import { syncProviderCredentials, upsertConnection } from "./providerCredentials.js";
 
 const credentialsSchema = z.object({
   email: z.string().email().transform((value) => value.toLowerCase()),
@@ -74,16 +74,21 @@ app.post("/api/auth/register", (request, response) => {
   response.status(201).json({ token: issueToken(user), user: safeUser(user) });
 });
 
-app.post("/api/auth/login", (request, response) => {
-  const parsed = credentialsSchema.safeParse(request.body);
-  if (!parsed.success) {
-    return response.status(400).json({ error: parsed.error.issues[0].message });
+app.post("/api/auth/login", async (request, response, next) => {
+  try {
+    const parsed = credentialsSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return response.status(400).json({ error: parsed.error.issues[0].message });
+    }
+    const user = database.prepare("SELECT * FROM users WHERE email = ?").get(parsed.data.email);
+    if (!user || !verifyPassword(parsed.data.password, user.password_hash)) {
+      return response.status(401).json({ error: "Incorrect email or password" });
+    }
+    await syncProviderCredentials(user.id);
+    response.json({ token: issueToken(user), user: safeUser(user) });
+  } catch (error) {
+    next(error);
   }
-  const user = database.prepare("SELECT * FROM users WHERE email = ?").get(parsed.data.email);
-  if (!user || !verifyPassword(parsed.data.password, user.password_hash)) {
-    return response.status(401).json({ error: "Incorrect email or password" });
-  }
-  response.json({ token: issueToken(user), user: safeUser(user) });
 });
 
 app.post("/api/auth/firebase", async (request, response, next) => {
@@ -97,25 +102,20 @@ app.post("/api/auth/firebase", async (request, response, next) => {
     const now = new Date().toISOString();
     const name = identity.name || identity.email.split("@")[0];
     database.prepare(`
-      INSERT INTO users (name, email, password_hash, role, created_at)
-      VALUES (?, ?, 'firebase-managed', 'engineer', ?)
-      ON CONFLICT(email) DO UPDATE SET name=excluded.name
-    `).run(name, identity.email.toLowerCase(), now);
+      INSERT INTO users (name, email, firebase_uid, password_hash, role, created_at)
+      VALUES (?, ?, ?, 'firebase-managed', 'engineer', ?)
+      ON CONFLICT(email) DO UPDATE SET
+        name=excluded.name, firebase_uid=excluded.firebase_uid
+    `).run(name, identity.email.toLowerCase(), identity.uid, now);
     const user = database.prepare("SELECT * FROM users WHERE email = ?").get(identity.email.toLowerCase());
-    database.prepare(`
-      INSERT INTO provider_connections
-        (user_id, provider, access_token, account_id, account_name, metadata, created_at, updated_at)
-      VALUES (?, 'github', ?, ?, ?, '{}', ?, ?)
-      ON CONFLICT(user_id, provider) DO UPDATE SET
-        access_token=excluded.access_token, account_id=excluded.account_id,
-        account_name=excluded.account_name, updated_at=excluded.updated_at
-    `).run(
+    await syncProviderCredentials(user.id);
+    await upsertConnection(
       user.id,
-      encryptSecret(parsed.githubAccessToken),
+      "github",
+      parsed.githubAccessToken,
       identity.firebase?.identities?.["github.com"]?.[0] || identity.uid,
       name,
-      now,
-      now,
+      {},
     );
     response.json({ token: issueToken(user), user: safeUser(user) });
   } catch (error) {

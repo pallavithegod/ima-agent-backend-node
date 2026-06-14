@@ -1,4 +1,5 @@
 .env
+azure-app-settings.json
 service-account.json
 node_modules/
 storage/

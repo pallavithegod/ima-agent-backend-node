@@ -7,7 +7,7 @@ dotenv.config({ path: resolve(serviceRoot, ".env") });
 
 export const config = {
   environment: process.env.NODE_ENV || "development",
-  port: Number(process.env.NODE_PORT || 4000),
+  port: Number(process.env.PORT || process.env.NODE_PORT || 4000),
   databasePath: resolve(serviceRoot, process.env.NODE_DATABASE_PATH || "./storage/auth.db"),
   jwtSecret: process.env.AUTH_JWT_SECRET || "development-only-secret-change-me",
   credentialKey: process.env.CREDENTIAL_ENCRYPTION_KEY || "",
@@ -25,6 +25,7 @@ export const config = {
   firebaseProjectId: process.env.FIREBASE_PROJECT_ID || "",
   firebaseClientEmail: process.env.FIREBASE_CLIENT_EMAIL || "",
   firebasePrivateKey: (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+  firebaseServiceAccountBase64: process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "",
   firebaseServiceAccountPath: resolve(
     serviceRoot,
     process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./service-account.json",

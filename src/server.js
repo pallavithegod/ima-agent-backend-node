@@ -47,18 +47,64 @@ function updateWorkflowFromSync(userId, payload) {
 }
 
 async function triggerDeploymentInspection(user) {
-  const response = await fetch(
-    `${config.pythonBackendUrl.replace(/\/$/, "")}/api/integrations/vercel/sync`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${issueToken(user)}`,
-        "Content-Type": "application/json",
+  const authorization = `Bearer ${issueToken(user)}`;
+  const endpoints = [];
+  const vercel = database.prepare(`
+    SELECT 1
+    FROM provider_connections
+    JOIN tracked_projects ON tracked_projects.user_id = provider_connections.user_id
+    WHERE provider_connections.user_id = ?
+      AND provider_connections.provider = 'vercel'
+      AND tracked_projects.enabled = 1
+    LIMIT 1
+  `).get(user.id);
+  const render = database.prepare(`
+    SELECT 1
+    FROM provider_connections
+    JOIN render_services ON render_services.user_id = provider_connections.user_id
+    WHERE provider_connections.user_id = ?
+      AND provider_connections.provider = 'render'
+      AND render_services.enabled = 1
+    LIMIT 1
+  `).get(user.id);
+  if (vercel) endpoints.push("vercel");
+  if (render) endpoints.push("render");
+  if (!endpoints.length) {
+    return {
+      response: { ok: false, status: 409 },
+      payload: { results: [], providers: [] },
+    };
+  }
+  const attempts = await Promise.all(endpoints.map(async (provider) => {
+    const response = await fetch(
+      `${config.pythonBackendUrl.replace(/\/$/, "")}/api/integrations/${provider}/sync`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: authorization,
+          "Content-Type": "application/json",
+        },
       },
-    },
-  );
-  const payload = await response.json().catch(() => ({}));
-  if (response.ok) updateWorkflowFromSync(user.id, payload);
+    );
+    const payload = await response.json().catch(() => ({}));
+    return { provider, response, payload };
+  }));
+  const successful = attempts.filter((attempt) => attempt.response.ok);
+  const payload = {
+    results: successful.flatMap((attempt) => attempt.payload.results || []),
+    providers: attempts.map((attempt) => ({
+      provider: attempt.provider,
+      ok: attempt.response.ok,
+      error: attempt.response.ok
+        ? null
+        : attempt.payload.detail || attempt.payload.error || `Sync failed (${attempt.response.status})`,
+    })),
+  };
+  if (successful.length) updateWorkflowFromSync(user.id, payload);
+  const response = {
+    ok: successful.length > 0,
+    status: successful.length > 0 ? 200 : attempts[0]?.response.status || 502,
+  };
   return { response, payload };
 }
 
