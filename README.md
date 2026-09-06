@@ -1,4 +1,9 @@
-# RecallOps Node Backend
+# RecallOps Node Backend — RETIRED
+
+> **This backend is retired.** All of its functionality (auth, provider
+> credentials, integrations, commit monitor) was migrated to
+> `ima-agent-backend-python`, which is now the only backend. This repo is kept
+> for reference only — do not run it alongside the Python backend.
 
 This service owns authentication, provider credentials, repository imports,
 project mappings, provider health, and the continuous monitoring scheduler for
